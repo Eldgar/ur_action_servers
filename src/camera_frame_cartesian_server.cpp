@@ -15,6 +15,11 @@
 #include <moveit/move_group_interface/move_group_interface.h>
 #include <moveit_msgs/msg/robot_trajectory.hpp>
 
+#include <tf2_ros/buffer.h>
+#include <tf2_ros/transform_listener.h>
+#include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>   // tf2::doTransform helpers
+#include <tf2/LinearMath/Transform.h>
+
 #include <chrono>
 #include <memory>
 #include <string>
@@ -31,7 +36,9 @@ class RG2CartesianServer : public rclcpp::Node
 {
 public:
   RG2CartesianServer()
-  : Node("rg2_cartesian_server")
+  : Node("rg2_cartesian_server"),
+    tf_buffer_(this->get_clock()),
+    tf_listener_(tf_buffer_)          // <-- initialise the listener
   {
     init_timer_ = create_wall_timer(1s, std::bind(&RG2CartesianServer::late_init,this));
   }
@@ -49,6 +56,7 @@ private:
       mg_->setMaxVelocityScalingFactor(0.1);
       mg_->setMaxAccelerationScalingFactor(0.1);
       mg_->setPlanningTime(5.0);
+      mg_->setPoseReferenceFrame("D415_color_optical_frame");
     } catch (const std::exception &e) {
       RCLCPP_FATAL(get_logger(),"MoveGroup init failed: %s",e.what());
       rclcpp::shutdown();
@@ -79,6 +87,7 @@ private:
     RCLCPP_INFO(get_logger(),
       "Offsets request  x:%.3f  y:%.3f  z:%.3f  (planning frame)",
       goal->x,goal->y,goal->z);
+    RCLCPP_INFO(get_logger(),"Planning in frame: %s",mg_->getPoseReferenceFrame().c_str());
     return rclcpp_action::GoalResponse::ACCEPT_AND_EXECUTE;
   }
 
@@ -97,20 +106,61 @@ private:
   /* main execution */
   void execute(const std::shared_ptr<GoalHandle> gh)
   {
-    const auto goal=gh->get_goal();
-    auto start_pose = mg_->getCurrentPose().pose;
+    using tf2::Vector3;
+    const std::string camera_frame = "D415_color_optical_frame";
+    const std::string base_frame   = "base_link";
 
-    geometry_msgs::msg::Pose target = start_pose;
-    target.position.x += goal->x;
-    target.position.y += goal->y;
-    target.position.z += goal->z;
+    // Ensure planning is done in the base frame
+    mg_->setPoseReferenceFrame(base_frame);
 
+    // Retrieve the goal offsets
+    const auto goal = gh->get_goal();
+
+    /* ---- 1.  Fetch the transform C → B ----------------------------------- */
+    geometry_msgs::msg::TransformStamped T_B_C_msg;
+    try
+    {
+      // newest available transform is fine for a Cartesian jog
+      T_B_C_msg = tf_buffer_.lookupTransform(
+                    base_frame,         // target frame
+                    camera_frame,       // source frame
+                    tf2::TimePointZero);
+    }
+    catch (const tf2::TransformException &ex)
+    {
+      RCLCPP_ERROR(get_logger(),
+                   "TF lookup %s→%s failed: %s",
+                   camera_frame.c_str(), base_frame.c_str(), ex.what());
+      gh->abort(make_result(false,"TF lookup failed"));
+      return;
+    }
+
+    /* ---- 2.  Express the requested offset in base_link ------------------- */
+    // goal offset expressed in the camera optical frame
+    Vector3 offset_C(goal->x, goal->y, goal->z);
+
+    // build tf2::Transform from the geometry_msg
+    tf2::Transform T_B_C;
+    tf2::fromMsg(T_B_C_msg.transform, T_B_C);
+
+    // rotate the offset into base frame (no translation – pure vector)
+    Vector3 offset_B = T_B_C.getBasis() * offset_C;
+
+    /* ---- 3.  Build the Cartesian waypoint in base_link ------------------- */
+    geometry_msgs::msg::Pose start_pose = mg_->getCurrentPose().pose;
+    geometry_msgs::msg::Pose target     = start_pose;
+    target.position.x += offset_B.x();
+    target.position.y += offset_B.y();
+    target.position.z += offset_B.z();
+
+    /* ---- 4.  Cartesian path & execution (unchanged) ---------------------- */
     std::vector<geometry_msgs::msg::Pose> waypoints{target};
     moveit_msgs::msg::RobotTrajectory traj;
     double fraction = mg_->computeCartesianPath(
-        waypoints, 0.005 /*eef_step*/, 0.0 /*jump_thresh*/, traj, true);
+                         waypoints, 0.005, 0.0, traj, true);
 
-    if (fraction < 0.99) {
+    if (fraction < 0.99)
+    {
       gh->abort(make_result(false,"Cartesian planning failed"));
       return;
     }
@@ -118,12 +168,13 @@ private:
     moveit::planning_interface::MoveGroupInterface::Plan plan;
     plan.trajectory_ = traj;
 
-    if (mg_->execute(plan) != moveit::core::MoveItErrorCode::SUCCESS) {
+    if (mg_->execute(plan) != moveit::core::MoveItErrorCode::SUCCESS)
+    {
       gh->abort(make_result(false,"Execution failed"));
       return;
     }
 
-    /* simple progress feedback */
+    /* progress feedback loop (as before) */
     auto fb = std::make_shared<Rg2Move::Feedback>();
     rclcpp::Rate r(20);
     for(int i=0;i<=20 && rclcpp::ok();++i){
@@ -142,6 +193,8 @@ private:
   rclcpp::TimerBase::SharedPtr init_timer_;
   moveit::planning_interface::MoveGroupInterfacePtr mg_;
   rclcpp_action::Server<Rg2Move>::SharedPtr server_;
+  tf2_ros::Buffer tf_buffer_;
+  tf2_ros::TransformListener tf_listener_;
 };
 
 /* ------------- main ------------- */

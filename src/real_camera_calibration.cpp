@@ -1,10 +1,12 @@
 #include <rclcpp/rclcpp.hpp>
 #include <rclcpp_action/rclcpp_action.hpp>
+#include <std_msgs/msg/float64.hpp>        
 
 #include <tf2_ros/transform_broadcaster.h>
 #include <tf2_ros/transform_listener.h>
 #include <tf2/LinearMath/Quaternion.h>
 #include <tf2_eigen/tf2_eigen.hpp>
+#include <tf2_ros/static_transform_broadcaster.h>
 
 #include <geometry_msgs/msg/transform_stamped.hpp>
 #include <moveit/move_group_interface/move_group_interface.h>
@@ -33,6 +35,12 @@ public:
     tf_listener_(tf_buffer_)
   {
     tf_broadcaster_ = std::make_shared<tf2_ros::TransformBroadcaster>(this);
+    static_broadcaster_ = std::make_shared<tf2_ros::StaticTransformBroadcaster>(this);
+
+    auto distance_qos = rclcpp::QoS(rclcpp::KeepLast(1))
+                          .reliable()          // ensure delivery
+                          .transient_local();  // latch last value
+    distance_pub_ = create_publisher<std_msgs::msg::Float64>("/d415_distance", distance_qos);
 
     server_ = rclcpp_action::create_server<CameraCalibrate>(
         this, "camera_calibrate",
@@ -151,35 +159,15 @@ private:
         continue;
       }
 
-      // Average translation
-      Eigen::Vector3d avg_t = Eigen::Vector3d::Zero();
-      for (const auto &t : detections) avg_t += t.translation();
-      avg_t /= detections.size();
-
       Eigen::Isometry3d avg_tf = Eigen::Isometry3d::Identity();
-      avg_tf.linear() = detections.front().rotation();
-      avg_tf.translation() = avg_t;
-      tf_samples_.push_back(avg_tf);
+      avg_tf.linear() = detections.front().rotation();   // keep orientation
+      tf_samples_.push_back(avg_tf);                     // translation ignored
     }
 
     if (tf_samples_.empty()) {
       RCLCPP_ERROR(get_logger(), "❌ Calibration failed – no TF samples.");
       return false;
     }
-
-    // Mean translation
-    Eigen::Vector3d mean_pos = Eigen::Vector3d::Zero();
-    for (auto &tf : tf_samples_) mean_pos += tf.translation();
-    mean_pos /= tf_samples_.size();
-
-    // Covariance
-    Eigen::Matrix3d pos_cov = Eigen::Matrix3d::Zero();
-    for (auto &tf : tf_samples_) {
-      Eigen::Vector3d d = tf.translation() - mean_pos;
-      pos_cov += d * d.transpose();
-    }
-    pos_cov /= tf_samples_.size();
-    Eigen::Vector3d pos_stddev = pos_cov.eigenvalues().cwiseSqrt().real();
 
     // Mean rotation
     std::vector<Eigen::Quaterniond> quats;
@@ -191,6 +179,17 @@ private:
       mean_q = mean_q.slerp(1.0 / (i + 1), quats[i]);
     }
     mean_q.normalize();
+
+    // Get current camera position
+    Eigen::Vector3d cur_pos;
+    {
+        Eigen::Isometry3d tf_now = computeTF(TARGET_FRAME);   // base → camera
+        if (tf_now.isApprox(Eigen::Isometry3d::Identity())) {
+            RCLCPP_ERROR(get_logger(), "No valid TF for current camera position.");
+            return false;
+        }
+        cur_pos = tf_now.translation();
+    }
 
     // Rotation covariance
     Eigen::Matrix3d rot_cov = Eigen::Matrix3d::Zero();
@@ -205,18 +204,14 @@ private:
     Eigen::Vector3d rot_stddev = rot_cov.eigenvalues().cwiseSqrt().real();
 
     RCLCPP_INFO(get_logger(),
-      "\n Mean Position:       (%.4f, %.4f, %.4f)"
-      "\n Mean Orientation:    (x=%.4f, y=%.4f, z=%.4f, w=%.4f)"
-      "\nσ Translation:          (%.4f, %.4f, %.4f)"
-      "\nσ Rotation (radians*):  (%.4f, %.4f, %.4f)",
-      mean_pos.x(), mean_pos.y(), mean_pos.z(),
-      mean_q.x(), mean_q.y(), mean_q.z(), mean_q.w(),
-      pos_stddev.x(), pos_stddev.y(), pos_stddev.z(),
-      rot_stddev.x(), rot_stddev.y(), rot_stddev.z());
+      "\n Current Position:      (%.4f, %.4f, %.4f)"
+      "\n Mean Orientation:      (x=%.4f, y=%.4f, z=%.4f, w=%.4f)",
+      cur_pos.x(), cur_pos.y(), cur_pos.z(),
+      mean_q.x(), mean_q.y(), mean_q.z(), mean_q.w());
 
     // Represent the measured transform T_base_to_color_measured
     Eigen::Isometry3d T_base_to_color_measured = Eigen::Isometry3d::Identity();
-    T_base_to_color_measured.translation() = mean_pos;
+    T_base_to_color_measured.translation() = cur_pos;
     T_base_to_color_measured.linear() = mean_q.toRotationMatrix();
 
     // --- Get the static transform T_link_to_color ---
@@ -234,10 +229,6 @@ private:
         RCLCPP_ERROR(get_logger(), "Could not get static transform from D415_link to D415_color_optical_frame: %s", ex.what());
         return false; // Cannot proceed without this transform
     }
-    // --- Alternatively, load T_link_to_color from URDF values ---
-    // T_link_to_color.translation() = Eigen::Vector3d(x, y, z); // from URDF origin xyz
-    // T_link_to_color.linear() = Eigen::AngleAxisd(roll, Eigen::Vector3d::UnitX()) * ... // from URDF origin rpy
-
 
     // --- Calculate the desired transform T_base_to_link ---
     Eigen::Isometry3d T_base_to_link_calculated = T_base_to_color_measured * T_link_to_color.inverse();
@@ -247,7 +238,6 @@ private:
     Eigen::Quaterniond final_q(T_base_to_link_calculated.linear());
     final_q.normalize();
 
-
     RCLCPP_INFO(get_logger(),
       "\n Measured Color Frame Pos: (%.4f, %.4f, %.4f)"
       "\n Measured Color Frame Quat:(x=%.4f, y=%.4f, z=%.4f, w=%.4f)"
@@ -255,7 +245,7 @@ private:
       "\n Static Link->Color Quat: (x=%.4f, y=%.4f, z=%.4f, w=%.4f)"
       "\n Calculated Link Pos: (%.4f, %.4f, %.4f)"
       "\n Calculated Link Quat: (x=%.4f, y=%.4f, z=%.4f, w=%.4f)",
-      mean_pos.x(), mean_pos.y(), mean_pos.z(),
+      cur_pos.x(), cur_pos.y(), cur_pos.z(),
       mean_q.x(), mean_q.y(), mean_q.z(), mean_q.w(),
       T_link_to_color.translation().x(), T_link_to_color.translation().y(), T_link_to_color.translation().z(),
       Eigen::Quaterniond(T_link_to_color.linear()).x(), Eigen::Quaterniond(T_link_to_color.linear()).y(), Eigen::Quaterniond(T_link_to_color.linear()).z(), Eigen::Quaterniond(T_link_to_color.linear()).w(),
@@ -274,7 +264,6 @@ private:
     mean_tf_.transform.rotation.z = final_q.z();
     mean_tf_.transform.rotation.w = final_q.w();
 
-
     /* ----- constant TF:  D415_link  →  D415_right_ir_frame ----- */
     ir_tf_.header.frame_id  = "D415_link";
     ir_tf_.child_frame_id   = "D415_right_ir_frame";
@@ -286,8 +275,16 @@ private:
     ir_tf_.transform.rotation.z = -0.5;
     ir_tf_.transform.rotation.w =  0.5;
 
-    return true;
+    // Publish the distance from base_link to D415_link
+    {
+      std_msgs::msg::Float64 msg;
+      msg.data = final_pos.norm();
+      distance_pub_->publish(msg);
+      RCLCPP_INFO(get_logger(),
+                  "Latched distance base_link→D415_link = %.4f m", msg.data);
+    }
 
+    return true;
   }
 
   bool moveToJointPose(const std::vector<double>& joints)
@@ -359,22 +356,31 @@ private:
   rclcpp::TimerBase::SharedPtr                                        timer_;
   geometry_msgs::msg::TransformStamped                                mean_tf_;
   geometry_msgs::msg::TransformStamped                                ir_tf_; 
+  std::shared_ptr<tf2_ros::StaticTransformBroadcaster>                static_broadcaster_;
+  geometry_msgs::msg::TransformStamped                                static_color_tf_;
   std::vector<Eigen::Isometry3d>                                      tf_samples_;
   rclcpp_action::Server<CameraCalibrate>::SharedPtr                   server_;
+  rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr                distance_pub_;
 
   const std::vector<std::vector<double>> joint_poses_ = {
-            {3.03425, -0.79504, 1.25535, -1.63884, 5.93630, -2.04130},
-            {2.96834, -0.16573, 0.67028, -1.27966, -0.18557, -2.39351},
-            // {2.96115, -0.51863, 0.57200, -1.06157, 5.90268, -2.30544},
-            // {2.97856, -1.19795, 2.07746, -1.92523, 5.91164, -2.09038},
-            // {2.76846, -1.30189, 1.94836, -1.34708, 5.77416, -2.47012},
-            {2.89589, -0.52993, 1.15244, -1.58780, 5.88960, -2.19087},
-            {2.81969, -0.64596, 1.62408, -1.80887, 5.84188, -2.33796},
-            {2.90300, -0.66354, 1.93476, -2.25093, 5.89349, -2.17547},
-            {2.96924, -0.27762, 0.96071, -1.80989, 5.92634, -2.01731},
-            {2.88067, -0.19469, 0.67950, -1.48274, 5.85636, -2.34294},
-            {2.53973, -0.50475, 1.59799, -1.50125, 5.65903, -2.81514},
-  };
+            // { 2.81891, -0.89820, 1.69067, -1.75335, -0.48133, -2.20762 },
+            // { 2.65093, -0.72145, 1.65343, -1.67958, -0.59240, -2.34463 },
+            // { 2.72545, -0.68781, 1.48349, -1.81851, -0.70533, -2.08955 },
+            // { 3.03425, -0.79504, 1.25535, -1.63884, -0.34689, -1.88130 },
+            { 2.76359, -0.87828, 1.58700, -1.83645, -0.71333, -2.09312 },
+            { 3.03425, -0.79504, 1.25535, -1.63884, -0.34689, -2.04130 },
+            { 3.03425, -0.79504, 1.25535, -1.63884, -0.34689, -2.14130 },
+            { 2.96834, -0.16573, 0.67028, -1.27966, -0.18557, -2.19351 },
+            { 2.96834, -0.16573, 0.67028, -1.27966, -0.18557, -2.39351 },
+            { 2.96834, -0.16573, 0.67028, -1.27966, -0.18557, -2.59351 },
+            { 2.89589, -0.52993, 1.15244, -1.58780, -0.39359, -2.19087 },
+            { 2.81969, -0.64596, 1.62408, -1.80887, -0.44131, -2.33796 },
+            { 2.90300, -0.66354, 1.93476, -2.25093, -0.38970, -2.17547 },
+            { 2.96924, -0.27762, 0.96071, -1.80989, -0.35685, -2.01731 },
+            { 2.88067, -0.19469, 0.67950, -1.48274, -0.42683, -2.34294 },
+            { 2.53973, -0.50475, 1.59799, -1.50125, -0.62416, -2.81514 },
+            { 2.76359, -0.87828, 1.58700, -1.83645, -0.71333, -2.09312 }
+    };
 
   /* ───── Pose to move to after calibration completes ───── */
   const std::vector<double> standby_pose_ = {0.0, -1.5708, 0.0, -1.5708, 0.0, -1.5708};

@@ -135,7 +135,7 @@ private:
 
       // 3) Phase A – plan to HOVER pose (5 cm above)
       geometry_msgs::msg::Pose hover = target;
-      hover.position.z += 0.07;   // 5 cm above target
+      hover.position.z += 0.07;   // 7 cm above target
 
       fb->status = "Planning hover";
       gh->publish_feedback(fb);
@@ -163,7 +163,7 @@ private:
 
       // 4) Phase B – Cartesian descend 5 cm
       geometry_msgs::msg::Pose mid = target;
-      mid.position.z += 0.035;   // 2.5 cm above final target
+      mid.position.z += 0.035;   // 3.5 cm above final target
       std::vector<geometry_msgs::msg::Pose> wps{hover, mid, target};
       moveit_msgs::msg::RobotTrajectory traj;
       double fraction = move_group_->computeCartesianPath(
@@ -202,7 +202,7 @@ private:
     if (goal->command == "go_home")
       joints = {0.0, -1.5708, 0.0, -1.5708, 0.0, -1.5708};
     else if (goal->command == "initial")
-      joints = {2.9147, 0.0349, 0.1740, -0.8203, -0.2269, -2.51327};
+      joints = {2.87216, -0.67663, 1.50457, -1.34811, -0.26294, -2.60747};
     else if (goal->command == "out_of_view")
       joints = {2.26245, -0.68643, 1.42895, -0.68210, -0.85862, -1.62380};
     else if (goal->command == "pick_and_place")

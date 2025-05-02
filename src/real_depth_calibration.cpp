@@ -1,5 +1,5 @@
 /*********************************************************************
- * aruco_calibration_server.cpp
+ * real_depth_calibration.cpp
  *
  * Action server that drives the UR3e through a series of joint poses,
  * waits for the ArUco-centre pixel, its depth, and base←marker TF,
@@ -22,14 +22,10 @@
 
 #include <moveit/move_group_interface/move_group_interface.h>
 
-#include <tf2_ros/buffer.h>
-#include <tf2_ros/transform_listener.h>
-#include <tf2_ros/transform_broadcaster.h>
-#include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
-#include <tf2_eigen/tf2_eigen.hpp>
-
 #include <image_transport/image_transport.hpp>
 #include <sensor_msgs/msg/image.hpp>
+#include <sensor_msgs/msg/compressed_image.hpp>
+#include <sensor_msgs/image_encodings.hpp>
 #include <geometry_msgs/msg/point32.hpp>
 #include <geometry_msgs/msg/transform_stamped.hpp>
 #include <cv_bridge/cv_bridge.h>
@@ -37,481 +33,261 @@
 #include <Eigen/Dense>
 #include <opencv2/imgproc.hpp>
 #include <opencv2/aruco.hpp>
+#include <opencv2/highgui.hpp>  // for imshow
+#include <opencv2/calib3d.hpp>
 
 #include "ur_action_servers/action/camera_calibrate.hpp"
 
+#include <tf2_ros/buffer.h>
+#include <tf2_ros/transform_listener.h>
+#include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
+#include <fstream>
+
 using namespace std::chrono_literals;
+
+using CameraCalibrate = ur_action_servers::action::CameraCalibrate;
+using GoalHandle = rclcpp_action::ServerGoalHandle<CameraCalibrate>;
 
 class ArucoCalibrationServer : public rclcpp::Node
 {
-  /* ──────────────── aliases ──────────────── */
-  using CameraCalibrate = ur_action_servers::action::CameraCalibrate;
-  using GoalHandle      = rclcpp_action::ServerGoalHandle<CameraCalibrate>;
-
 public:
   ArucoCalibrationServer() :
     Node("aruco_calibration_server"),
     tf_buffer_(this->get_clock()),
     tf_listener_(tf_buffer_)
   {
+    /* Defer MoveIt group initialisation until after constructor */
+    init_timer_ = create_wall_timer(500ms,[this]{
+        if (mg_) return;
+        mg_ = std::make_shared<moveit::planning_interface::MoveGroupInterface>(shared_from_this(), "ur_manipulator");
+        mg_->setPlanningTime(10.0);
+        mg_->setMaxVelocityScalingFactor(0.2);
+        init_timer_->cancel();
+    });
 
+    /* Camera subs */
+    color_sub_ = this->create_subscription<sensor_msgs::msg::CompressedImage>(
+        "/D415/color/image_raw/compressed", rclcpp::SensorDataQoS(),
+        std::bind(&ArucoCalibrationServer::colorCb, this, std::placeholders::_1));
 
-    /* ─────────── MoveIt setup ─────────── */
-    // move_group_ = std::make_shared<moveit::planning_interface::MoveGroupInterface>(
-    //     this->shared_from_this(), "ur_manipulator");
-    // move_group_->setPlanningTime(10.0);
-    // move_group_->setMaxVelocityScalingFactor(0.3);
-
-    /* ─────────── action server ─────────── */
-    action_server_ = rclcpp_action::create_server<CameraCalibrate>(
-        this,
-        "depth_calibrate",
-        std::bind(&ArucoCalibrationServer::handle_goal,    this, std::placeholders::_1, std::placeholders::_2),
-        std::bind(&ArucoCalibrationServer::handle_cancel,  this, std::placeholders::_1),
-        std::bind(&ArucoCalibrationServer::handle_accepted,this, std::placeholders::_1));
-
-    /* ─────────── subscribers ─────────── */
-    //  Color image (for ArUco detection)
-    color_sub_ = image_transport::create_subscription(
-        this, "/D415/color/image_raw",
-        std::bind(&ArucoCalibrationServer::colorCb, this, std::placeholders::_1),
-        "raw");
-
-    //  Aligned depth image to query depth at detected pixel
     depth_sub_ = image_transport::create_subscription(
         this, "/D415/aligned_depth_to_color/image_raw",
-        std::bind(&ArucoCalibrationServer::depthCb, this, std::placeholders::_1),
-        "raw");
-    debug_pub_ = image_transport::create_publisher(this, "/calib_debug/image");
+        std::bind(&ArucoCalibrationServer::depthCb,this,std::placeholders::_1), "raw");
 
+    /* Intrinsics */
+    K_ = (cv::Mat_<double>(3,3) << 306.805847,0,214.441849,
+                                   0,306.642456,124.910301,
+                                   0,0,1);
+    D_ = cv::Mat::zeros(5,1,CV_64F);
+    dict_ = cv::aruco::getPredefinedDictionary(cv::aruco::DICT_4X4_50);
+    params_ = cv::aruco::DetectorParameters::create();
 
-    ur_tf_sub_ = create_subscription<geometry_msgs::msg::TransformStamped>(
-        "/ur_transform", 10,
-        std::bind(&ArucoCalibrationServer::urTfCb, this, std::placeholders::_1));
+    /* action server */
+    server_ = rclcpp_action::create_server<CameraCalibrate>(
+        this,
+        "depth_calibrate",
+        std::bind(&ArucoCalibrationServer::handleGoal,this,std::placeholders::_1,std::placeholders::_2),
+        std::bind(&ArucoCalibrationServer::handleCancel,this,std::placeholders::_1),
+        std::bind(&ArucoCalibrationServer::handleAccept,this,std::placeholders::_1));
 
-    tf_pub_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
-
-    /* ─────────── joint targets ─────────── */
+    /* target joints */
     target_joints_ = {
         {2.56935, -0.28104, 1.72121, -1.69158, -0.54607, -2.89642},
+        {2.56935, -0.28104, 1.72121, -1.69158, -0.54607, -2.39642},
         {2.34848, -0.28942, 1.44769, -1.45035, -0.77670, -2.90084},
+        {2.34848, -0.28942, 1.44769, -1.45035, -0.77670, -2.60084},
         {2.55849, -0.07539, 0.89807, -1.20097, -0.57799, -2.79087},
-        {2.55849, -0.07539, 0.89807, -1.20097, -0.57799, -2.79087},
-        {2.55849, -0.07539, 0.89807, -1.20097, -0.57799, -2.79087},
+        {2.55849, -0.07539, 0.89807, -1.20097, -0.57799, -2.39087},
         {2.50411, -0.49894, 1.33130, -1.44830, -0.70317, -2.61530},
         {2.33896, -0.49356, 1.67311, -1.70402, -0.84243, -2.74282},
-        {2.40193, -0.44400, 1.54049, -1.65163, -0.78845, -2.69828}};
+        {2.33896, -0.49356, 1.67311, -1.70402, -0.84243, -2.34282},
+        {2.40193, -0.44400, 1.54049, -1.65163, -0.78845, -2.69828},
+        {2.40193, -0.44400, 1.54049, -1.65163, -0.78845, -2.49828},
+    };
+    csv_.open("depth_calibration_samples.csv", std::ios::out | std::ios::app);
   }
 
-    // Call this once the node is inside a shared_ptr
-    void init_move_group()
-    {
-        move_group_ = std::make_shared<moveit::planning_interface::MoveGroupInterface>(
-            shared_from_this(), "ur_manipulator");
-        move_group_->setPlanningTime(10.0);
-        move_group_->setMaxVelocityScalingFactor(0.3);
-    }
-
 private:
-  /* ───────── helper structs & enums ───────── */
-  struct Sample
-    {
-    Eigen::Vector3d p_B_M;   // marker origin in base
-    double          range;   // depth along optical axis (metres)
-    };
-    image_transport::Publisher debug_pub_;  
-    enum class Stage { IDLE, MOVING, WAITING } stage_{Stage::IDLE};
-
-  /* ───────── ROS handles ───────── */
-  tf2_ros::Buffer     tf_buffer_;
-  tf2_ros::TransformListener tf_listener_;
-  std::unique_ptr<tf2_ros::TransformBroadcaster> tf_pub_;
-  std::shared_ptr<moveit::planning_interface::MoveGroupInterface> move_group_;
-
-  // image subscribers
-  image_transport::Subscriber                                        color_sub_;
-  image_transport::Subscriber                                        depth_sub_;
-  rclcpp::Subscription<geometry_msgs::msg::TransformStamped>::SharedPtr ur_tf_sub_;
-
-  rclcpp_action::Server<CameraCalibrate>::SharedPtr action_server_;
-
-  /* ───────── runtime state ───────── */
-  std::vector<std::array<double,6>> target_joints_;
-  size_t                idx_{0};
-  geometry_msgs::msg::Point32 last_px_;
-  double                 last_depth_{0.0};
-  bool                   got_px_{false}, got_depth_{false};
-  Eigen::Isometry3d      last_T_B_M_{Eigen::Isometry3d::Identity()};
-  std::vector<Sample>    samples_;
-  std::mutex             mutex_;              // protects shared state
-  std::shared_ptr<GoalHandle> active_goal_;   // current goal handle
-  rclcpp::Time            wait_until_;   // deadline for marker/depth at current pose
-
-  /* ════════════════════════════════════════════════════════════════════════
-   *                      Action-server callbacks
-   * ════════════════════════════════════════════════════════════════════════ */
-  rclcpp_action::GoalResponse
-  handle_goal(const rclcpp_action::GoalUUID &,
-              std::shared_ptr<const CameraCalibrate::Goal> goal)
+  /* goal callbacks */
+  rclcpp_action::GoalResponse handleGoal(const rclcpp_action::GoalUUID &,
+                                         CameraCalibrate::Goal::ConstSharedPtr goal) const
   {
-    if (stage_ != Stage::IDLE) {
-      RCLCPP_WARN(get_logger(), "Calibration already running – rejecting new goal");
-      return rclcpp_action::GoalResponse::REJECT;
-    }
     if (goal->command != "start") {
-      RCLCPP_WARN(get_logger(), "Unknown command \"%s\"", goal->command.c_str());
+      RCLCPP_WARN(get_logger(),"Unknown command %s",goal->command.c_str());
       return rclcpp_action::GoalResponse::REJECT;
     }
     return rclcpp_action::GoalResponse::ACCEPT_AND_EXECUTE;
   }
 
-  rclcpp_action::CancelResponse
-  handle_cancel(const std::shared_ptr<GoalHandle> /*goal_handle*/)
-  {
-    std::lock_guard<std::mutex> lk(mutex_);
-    RCLCPP_INFO(get_logger(), "Cancel request received");
-    stage_ = Stage::IDLE;
-    move_group_->stop();
+  rclcpp_action::CancelResponse handleCancel(const std::shared_ptr<GoalHandle>){
+    if (mg_) mg_->stop();
     return rclcpp_action::CancelResponse::ACCEPT;
   }
 
-  void handle_accepted(const std::shared_ptr<GoalHandle> goal_handle)
-  {
-    /* run the long-running job in a separate thread so the executor can
-       continue spinning subscriptions */
-    std::thread{&ArucoCalibrationServer::execute, this, goal_handle}.detach();
+  void handleAccept(const std::shared_ptr<GoalHandle> gh){
+    std::thread(&ArucoCalibrationServer::execute,this,gh).detach();
   }
 
-
-
-  /* ───────── main execute routine ───────── */
-  void execute(const std::shared_ptr<GoalHandle> goal_handle)
+  void execute(std::shared_ptr<GoalHandle> gh)
   {
-    active_goal_ = goal_handle;
     auto feedback = std::make_shared<CameraCalibrate::Feedback>();
+    for(size_t i=0;i<target_joints_.size();++i){
+      const auto &pose = target_joints_[i];
+      sample_ready_=false; color_ready_=false;
 
-    {
-      std::lock_guard<std::mutex> lk(mutex_);
-      stage_  = Stage::MOVING;
-      idx_    = 0;
-      samples_.clear();
-      got_px_ = got_depth_ = false;
-      feedback->status = "Starting calibration (pose 1)";
-      goal_handle->publish_feedback(feedback);
-    }
+      feedback->status = "moving to pose "+std::to_string(i+1)+"/"+std::to_string(target_joints_.size());
+      gh->publish_feedback(feedback);
 
-    RCLCPP_INFO(get_logger(), "Starting calibration – moving to pose 1/%zu",
-                target_joints_.size());
-    moveToPose();
-
-    // Wait until the goal finishes (either success, cancel, or timeout)
-    rclcpp::Rate r(10);
-    while (rclcpp::ok())
-    {
-      bool timed_out = false;
-      {
-        std::lock_guard<std::mutex> lk(mutex_);
-
-        // If calibration has already finished (result() set active_goal_ to nullptr)
-        if (stage_ == Stage::IDLE && !active_goal_) {
-          return;   // success path finished – exit execute()
-        }
-
-        // If client cancelled (goal still valid but cancel requested elsewhere)
-        if (stage_ == Stage::IDLE && active_goal_) {
-          result(false, "Cancelled by client");
-          return;
-        }
-
-        // timeout check while waiting for detections
-        if (stage_ == Stage::WAITING && now() > wait_until_) {
-          timed_out = true;
-          stage_ = Stage::MOVING; // prevent re-entering here
-        }
+      RCLCPP_INFO(get_logger(),"Moving to pose %zu", i+1);
+      mg_->setJointValueTarget(pose);
+      moveit::planning_interface::MoveGroupInterface::Plan p;
+      if (mg_->plan(p)!=moveit::core::MoveItErrorCode::SUCCESS || mg_->execute(p)!=moveit::core::MoveItErrorCode::SUCCESS){
+        RCLCPP_ERROR(get_logger(),"Motion failed at index %zu", i);
+        auto res = std::make_shared<CameraCalibrate::Result>();
+        res->success=false; res->message="motion failed";
+        gh->abort(res); return;
       }
 
-      if (timed_out) {
-        RCLCPP_WARN(get_logger(), "⏱️  Timeout waiting for ArUco/depth at pose %zu", idx_ + 1);
-        publishFeedback("Timeout – skipping pose " + std::to_string(idx_ + 1));
+      RCLCPP_INFO(get_logger(),"Pose reached, settling 1 s");
+      rclcpp::sleep_for(1s);
 
-        if (++idx_ < target_joints_.size()) {
-          rclcpp::sleep_for(500ms);
-          moveToPose();
-        } else {
-          // finished all poses – evaluate samples
-          if (samples_.size() < 3) {
-            result(false, "❌ Calibration failed – only " + std::to_string(samples_.size()) + " valid samples");
-          } else {
-            if (samples_.size() == 3)
-              RCLCPP_WARN(get_logger(), "⚠️ Only 3 samples collected – results may be less accurate");
-            else
-              RCLCPP_INFO(get_logger(), "✅ %zu valid samples collected", samples_.size());
-            publishFeedback("Computing TF from " + std::to_string(samples_.size()) + " samples");
-            computeTf();
-          }
-        }
+      feedback->status = "waiting for marker";
+      gh->publish_feedback(feedback);
+      auto deadline = now()+rclcpp::Duration::from_seconds(10.0);
+      while(rclcpp::ok() && now()<deadline && !sample_ready_) rclcpp::sleep_for(100ms);
+      if(!sample_ready_){
+        RCLCPP_WARN(get_logger(),"No marker within 10 s at pose %zu", i);
+        continue; // skip sample
       }
-      r.sleep();
-    }
-    // Node shutting down:
-    result(false, "Aborted – node shutting down");
-  }
 
-  void result(bool ok, const std::string &msg)
-  {
+      logSample();
+      writeSample(pose);
+    }
+
     auto res = std::make_shared<CameraCalibrate::Result>();
-    res->success = ok;
-    res->message = msg;
-    active_goal_->succeed(res);
-    stage_ = Stage::IDLE;
-    active_goal_.reset();
+    res->success=true; res->message="all samples captured";
+    gh->succeed(res);
   }
 
-  /* ───────── subscriber callbacks ───────── */
-  void colorCb(const sensor_msgs::msg::Image::ConstSharedPtr &msg)
-  {
-  std::lock_guard<std::mutex> lk(mutex_);
-  if (stage_ != Stage::WAITING || got_px_) return;      // only once/pose
-
-  /* 1.  Convert to OpenCV BGR */
-  cv::Mat bgr;
-  try {
-    bgr = cv_bridge::toCvCopy(msg, "bgr8")->image;
-  } catch (const cv_bridge::Exception &e) {
-    RCLCPP_WARN(get_logger(), "cv_bridge failed: %s", e.what());
-    return;
+  /* callbacks */
+  void colorCb(const sensor_msgs::msg::CompressedImage::ConstSharedPtr &msg){
+    if(sample_ready_||color_ready_) return;
+    cv::Mat bgr=cv::imdecode(cv::Mat(msg->data),cv::IMREAD_COLOR);
+    if(bgr.empty()) return;
+    color_frame_=bgr.clone();
+    std::vector<int> ids; std::vector<std::vector<cv::Point2f>> corners;
+    cv::aruco::detectMarkers(bgr,dict_,corners,ids,params_);
+    if(ids.empty()) return;
+    corners_=corners[0];
+    px_=cv::Point2f(0,0); for(auto &p:corners_) px_+=p; px_*=0.25f;
+    color_ready_=true;
+  }
+  void depthCb(const sensor_msgs::msg::Image::ConstSharedPtr &msg){
+    if(!color_ready_||sample_ready_) return;
+    cv::Mat depth16; try{depth16=cv_bridge::toCvCopy(msg,sensor_msgs::image_encodings::TYPE_16UC1)->image;}catch(...){return;}
+    depth_frame_=depth16.clone();
+    int u=int(px_.x+0.5), v=int(px_.y+0.5); if(u<0||v<0||u>=depth16.cols||v>=depth16.rows) return;
+    uint16_t d=depth16.at<uint16_t>(v,u); if(d==0) return; z_=d/1000.0;
+    std::vector<cv::Point3f> obj={{-0.0225f,0.0225f,0},{0.0225f,0.0225f,0},{0.0225f,-0.0225f,0},{-0.0225f,-0.0225f,0}};
+    cv::Vec3d rvec,tvec; 
+#ifdef SOLVEPNP_IPPE_SQUARE
+    cv::solvePnP(obj,corners_,K_,D_,rvec,tvec,false,cv::SOLVEPNP_IPPE_SQUARE);
+#else
+    cv::solvePnP(obj,corners_,K_,D_,rvec,tvec,false,cv::SOLVEPNP_ITERATIVE);
+#endif
+    x_=tvec[0]; y_=tvec[1]; z_solve_=tvec[2]; sample_ready_=true;
   }
 
-  /* 2.  Detect the marker (same as before) */
-  static const auto dict   = cv::aruco::getPredefinedDictionary(cv::aruco::DICT_4X4_50);
-  static const auto params = cv::aruco::DetectorParameters::create();
+  void logSample(){
+    RCLCPP_INFO(get_logger(),"==== SAMPLE ====");
+    RCLCPP_INFO(get_logger(),"Pixel u=%d  v=%d", int(px_.x+0.5), int(px_.y+0.5));
+    RCLCPP_INFO(get_logger(),"Color SolvePnP  x=%.3f  y=%.3f  z=%.3f m", x_, y_, z_solve_);
+    RCLCPP_INFO(get_logger(),"Depth camera     z=%.3f m", z_);
+    double xp=(px_.x-K_.at<double>(0,2))*z_/K_.at<double>(0,0);
+    double yp=(px_.y-K_.at<double>(1,2))*z_/K_.at<double>(1,1);
+    RCLCPP_INFO(get_logger(),"Depth projection x=%.3f  y=%.3f m", xp, yp);
 
-  std::vector<int> ids;
-  std::vector<std::vector<cv::Point2f>> corners;
-  cv::aruco::detectMarkers(bgr, dict, corners, ids, params);
-  if (ids.empty()) return;                              // no marker
+    // Calculate percentage errors between ArUco and depth measurements
+    double z_error_pct = std::abs(z_solve_ - z_) / z_ * 100.0;
+    double x_error_pct = std::abs(x_ - xp) / xp * 100.0;
+    double y_error_pct = std::abs(y_ - yp) / yp * 100.0;
+    
+    RCLCPP_INFO(get_logger(),"Error percentages:");
+    RCLCPP_INFO(get_logger(),"  X: %.2f%%", x_error_pct);
+    RCLCPP_INFO(get_logger(),"  Y: %.2f%%", y_error_pct);
+    RCLCPP_INFO(get_logger(),"  Z: %.2f%%", z_error_pct);
 
-  cv::Point2f c(0,0);
-  for (auto &pt : corners[0]) c += pt;
-  c *= 0.25f;                       // marker centre (pixels)
+    // base_link <- aruco_link position
+    try {
+        auto tf = tf_buffer_.lookupTransform("base_link","aruco_link_rotated", tf2::TimePointZero, 50ms);
+        RCLCPP_INFO(get_logger(),"aruco_link in base:  x=%.3f  y=%.3f  z=%.3f m",
+                    tf.transform.translation.x,
+                    tf.transform.translation.y,
+                    tf.transform.translation.z);
+    } catch (const tf2::TransformException &e) {
+        RCLCPP_WARN(get_logger(),"TF lookup failed: %s", e.what());
+    }
 
-  last_px_.x = c.x;
-  last_px_.y = c.y;
-  got_px_    = true;
-
-  /* 3.  Annotate and publish the debug image now (depth added later) */
-  cv::Mat anno = bgr.clone();
-  cv::circle(anno, c, 5, {0,0,255}, -1);
-  cv::putText(anno, "await depth", c + cv::Point2f(5,-5),
-              cv::FONT_HERSHEY_SIMPLEX, 0.5, {255,255,255}, 1);
-
-  if (debug_pub_)          
-    debug_pub_.publish( cv_bridge::CvImage(msg->header, "bgr8", anno).toImageMsg() );
-
-  publishFeedback("aruco pixel detected");
+    /* visualisation */
+    if (!color_frame_.empty()) {
+        cv::Mat vis = color_frame_.clone();
+        cv::circle(vis, px_, 5, {0,0,255}, -1);
+        cv::imshow("color_marker", vis);
+    }
+    if (!depth_frame_.empty()) {
+        cv::Mat depth_vis; cv::convertScaleAbs(depth_frame_, depth_vis, 255.0/4000.0);
+        cv::applyColorMap(depth_vis, depth_vis, cv::COLORMAP_JET);
+        cv::circle(depth_vis, px_, 5, {0,0,255}, -1);
+        cv::imshow("depth_marker", depth_vis);
+    }
+    cv::waitKey(1);
   }
 
+  void writeSample(const std::vector<double>& joint){
+      if(!csv_.is_open()){
+          std::string path = "depth_calibration_samples.csv";
+          csv_.open(path, std::ios::out | std::ios::app);
+      }
+      if(!csv_header_written_){
+          csv_ << "j1,j2,j3,j4,j5,j6,u,v,color_x,color_y,color_z,depth_z,depth_x,depth_y,base_x,base_y,base_z\n";
+          csv_header_written_ = true;
+      }
+      double xp=(px_.x-K_.at<double>(0,2))*z_/K_.at<double>(0,0);
+      double yp=(px_.y-K_.at<double>(1,2))*z_/K_.at<double>(1,1);
+      double bx=0,by=0,bz=0;
+      try{
+          auto tf = tf_buffer_.lookupTransform("base_link","aruco_link_rotated", tf2::TimePointZero, 50ms);
+          bx=tf.transform.translation.x;
+          by=tf.transform.translation.y;
+          bz=tf.transform.translation.z;
+      }catch(const tf2::TransformException &){/* leave zeros */}
 
-  void depthCb(const sensor_msgs::msg::Image::ConstSharedPtr &msg)
-  {
-    std::lock_guard<std::mutex> lk(mutex_);
-    if (stage_ != Stage::WAITING || !got_px_) return;
-    auto cv_ptr = cv_bridge::toCvShare(msg);
-    int u = static_cast<int>(last_px_.x + 0.5);
-    int v = static_cast<int>(last_px_.y + 0.5);
-    if (u < 0 || v < 0 || u >= cv_ptr->image.cols || v >= cv_ptr->image.rows)
-      return;
-    uint16_t d_mm = cv_ptr->image.at<uint16_t>(v, u);
-    if (d_mm == 0) return;
-    last_depth_ = d_mm / 1000.0;
-    got_depth_  = true;
-
-      /* ---- DEBUG IMAGE WITH DEPTH LABEL ---- */
-  cv::Mat anno;
-    if (debug_pub_) {                 // publish only if someone listens
-        anno = cv_ptr->image.clone(); 
-        cv::circle(anno, {u,v}, 5, {0,0,255}, -1);
-        char txt[32]; std::snprintf(txt, sizeof(txt), "%.3f m", last_depth_);
-        cv::putText(anno, txt, {u+5,v-5},
-                    cv::FONT_HERSHEY_SIMPLEX, 0.5, {255,255,255}, 1);
-        debug_pub_.publish(cv_bridge::CvImage(msg->header, "bgr8", anno).toImageMsg());
-    }
-    publishFeedback("depth received");
-    maybeFinishPose();
+      csv_ << joint[0] << ',' << joint[1] << ',' << joint[2] << ',' << joint[3] << ',' << joint[4] << ',' << joint[5] << ','
+           << int(px_.x+0.5) << ',' << int(px_.y+0.5) << ','
+           << x_ << ',' << y_ << ',' << z_solve_ << ','
+           << z_ << ',' << xp << ',' << yp << ','
+           << bx << ',' << by << ',' << bz << '\n';
   }
 
-  void urTfCb(const geometry_msgs::msg::TransformStamped::SharedPtr msg)
-  {
-    if (msg->child_frame_id != "aruco_link_rotated") return;
-    std::lock_guard<std::mutex> lk(mutex_);
-    last_T_B_M_ = tf2::transformToEigen(*msg);
-  }
-
-  /* ───────── movement helpers ───────── */
-  void moveToPose()
-  {
-    stage_    = Stage::MOVING;
-    got_px_   = got_depth_ = false;
-
-    std::vector<double> vec(target_joints_[idx_].begin(), target_joints_[idx_].end());
-    move_group_->setJointValueTarget(vec);
-    moveit::planning_interface::MoveGroupInterface::Plan p;
-    if (move_group_->plan(p) != moveit::core::MoveItErrorCode::SUCCESS)
-    {
-      RCLCPP_ERROR(get_logger(), "Plan failed @ pose %zu", idx_ + 1);
-      result(false, "IK/plan failed");
-      return;
-    }
-    move_group_->execute(p);
-    stage_ = Stage::WAITING;
-
-    // set 15-second timeout for this pose
-    wait_until_ = now() + rclcpp::Duration::from_seconds(15.0);
-
-    publishFeedback("Reached pose " + std::to_string(idx_ + 1) +
-                    " – waiting for marker & depth");
-  }
-
-  void maybeFinishPose()
-    {
-    if (!(got_px_ && got_depth_)) return;
-
-    Sample s;
-    s.p_B_M = last_T_B_M_.translation();   // marker origin in base
-    s.range = last_depth_;                 // d_i  (metres)
-    samples_.push_back(s);
-
-    publishFeedback("Pose " + std::to_string(idx_ + 1) + " captured");
-
-    if (++idx_ < target_joints_.size())
-    {
-        rclcpp::sleep_for(500ms);
-        moveToPose();
-        return;
-    }
-
-    publishFeedback("Collected samples – computing TF");
-    computeTf();   // <─ will broadcast aruco_link_rotated → camera
-    RCLCPP_INFO(get_logger(),
-            "Sample %zu  pixel=(%.1f,%.1f)  depth=%.3f m  "
-            "p_B_M=(%.3f,%.3f,%.3f)",
-            idx_ + 1,
-            last_px_.x, last_px_.y, last_depth_,
-            s.p_B_M.x(), s.p_B_M.y(), s.p_B_M.z());
-
-
-    }
-
-
-  /* ───────── final computation ───────── */
-   void computeTf()
-    {
-    const size_t N = samples_.size();
-    if (N < 3)
-    {
-        RCLCPP_ERROR(get_logger(), "Need at least 3 samples, got %zu", N);
-        result(false, "Too few samples");
-        return;
-    }
-
-    RCLCPP_INFO(get_logger(), "----- Raw samples -----");
-    for (size_t i = 0; i < N; ++i)
-        RCLCPP_INFO(get_logger(),
-            "  %zu: P_B_M = (%.3f, %.3f, %.3f) m   range = %.3f m",
-            i,
-            samples_[i].p_B_M.x(),
-            samples_[i].p_B_M.y(),
-            samples_[i].p_B_M.z(),
-            samples_[i].range);
-    RCLCPP_INFO(get_logger(), "-----------------------");
-
-    /* ---------------------------------------------------------------
-    * 1.  Trilaterate p_B_C  from the (p_B_Mᵢ,  rᵢ) pairs
-    * --------------------------------------------------------------- */
-    Eigen::MatrixXd A(N - 1, 3);
-    Eigen::VectorXd b(N - 1);
-
-    const auto &s0 = samples_[0];
-    for (size_t i = 1; i < N; ++i)
-    {
-        const auto &si = samples_[i];
-
-        A.row(i-1) = 2.0 * (si.p_B_M - s0.p_B_M).transpose();
-        b(i-1)     =  s0.range*s0.range - si.range*si.range
-                    + si.p_B_M.squaredNorm() - s0.p_B_M.squaredNorm();
-    }
-
-    Eigen::Vector3d p_B_C =
-        A.colPivHouseholderQr().solve(b);           // camera position in base
-
-    /* ---------------------------------------------------------------
-    * 2.  Express the pose in the marker frame of *sample 0*
-    * --------------------------------------------------------------- */
-    const Eigen::Isometry3d &T_B_M0 = last_T_B_M_;   // still holds last value
-    Eigen::Isometry3d T_M_C = Eigen::Isometry3d::Identity();
-    T_M_C.translation() = T_B_M0.inverse() * p_B_C;   // p_M0_C
-
-    /* Orientation:  +Z points back to marker origin, build RHS frame */
-    Eigen::Vector3d z_cam = -T_M_C.translation().normalized(); // from C→M0
-    Eigen::Vector3d x_cam =
-        (fabs(z_cam.z()) < 0.9 ? Eigen::Vector3d::UnitZ()
-                                : Eigen::Vector3d::UnitY()).cross(z_cam).normalized();
-    Eigen::Vector3d y_cam = z_cam.cross(x_cam);
-    Eigen::Matrix3d R_M_C;
-    R_M_C.col(0) = x_cam;
-    R_M_C.col(1) = y_cam;
-    R_M_C.col(2) = z_cam;
-    T_M_C.linear() = R_M_C;
-
-    /* ---------------------------------------------------------------
-    * 3.  Broadcast  aruco_link_rotated → camera
-    * --------------------------------------------------------------- */
-    geometry_msgs::msg::TransformStamped tf_out =
-        tf2::eigenToTransform(T_M_C);
-    tf_out.header.stamp    = now();
-    tf_out.header.frame_id = "aruco_link_rotated";
-    tf_out.child_frame_id  = "calib_camera";
-    tf_pub_->sendTransform(tf_out);
-
-    RCLCPP_INFO(get_logger(),
-        "Camera in marker frame: (%.3f, %.3f, %.3f) m",
-        T_M_C.translation().x(),
-        T_M_C.translation().y(),
-        T_M_C.translation().z());
-
-    for (size_t i = 0; i < N; ++i)
-    {
-    double err = (p_B_C - samples_[i].p_B_M).norm() - samples_[i].range;
-    RCLCPP_INFO(get_logger(),
-        "   res[%zu] = %+7.4f m  (expected %.3f, got %.3f)",
-        i, err, samples_[i].range,
-        (p_B_C - samples_[i].p_B_M).norm());
-    }
-
-    result(true, "Calibration OK (marker frame)");
-    }
-
-  /* ───────── feedback helper ───────── */
-  void publishFeedback(const std::string &txt)
-  {
-    if (!active_goal_) return;
-    auto fb = std::make_shared<CameraCalibrate::Feedback>();
-    fb->status = txt;
-    active_goal_->publish_feedback(fb);
-    RCLCPP_INFO(get_logger(), "%s", txt.c_str());
-  }
-
-  /* sentinel for success path */
-  Stage IDLE_DONE = Stage::IDLE;  // not used but avoids compiler warnings
+  /* members */
+  rclcpp_action::Server<CameraCalibrate>::SharedPtr server_;
+  std::shared_ptr<moveit::planning_interface::MoveGroupInterface> mg_;
+  image_transport::Subscriber depth_sub_;
+  rclcpp::Subscription<sensor_msgs::msg::CompressedImage>::SharedPtr color_sub_;
+  cv::Ptr<cv::aruco::Dictionary> dict_; cv::Ptr<cv::aruco::DetectorParameters> params_;
+  cv::Mat K_,D_;
+  bool color_ready_=false,sample_ready_=false; cv::Point2f px_; std::vector<cv::Point2f> corners_;
+  double z_=0,x_=0,y_=0,z_solve_=0;
+  cv::Mat color_frame_, depth_frame_;
+  rclcpp::TimerBase::SharedPtr init_timer_;
+  tf2_ros::Buffer tf_buffer_;
+  tf2_ros::TransformListener tf_listener_;
+  std::vector<std::vector<double>> target_joints_;
+  std::ofstream csv_; bool csv_header_written_ = false;
 };
 
-/* ────────────────────────── main ────────────────────────── */
-int main(int argc, char **argv)
-{
-  rclcpp::init(argc, argv);
-  auto node = std::make_shared<ArucoCalibrationServer>();
-  node->init_move_group();
-  rclcpp::spin(node);
-  rclcpp::shutdown();
-  return 0;
+int main(int argc,char** argv){rclcpp::init(argc,argv);
+    rclcpp::spin(std::make_shared<ArucoCalibrationServer>());
+    rclcpp::shutdown();
+    return 0;
 }
